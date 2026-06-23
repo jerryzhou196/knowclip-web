@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Knowclip Lite</title>
+<!-- sql.js builds the Anki collection DB; JSZip packs it into a real .apkg -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<!-- pinyin for Chinese subtitle text -->
+<script src="https://unpkg.com/pinyin-pro@3.28.1/dist/index.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.4 system-ui, sans-serif; margin: 0; padding: 1rem; max-width: 1100px; }
+  h1 { font-size: 1.3rem; margin: 0 0 .75rem; }
+  video { width: 100%; max-height: 50vh; background: #000; border-radius: 6px; }
+  .row { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; margin: .6rem 0; }
+  label.file { display: inline-flex; flex-direction: column; font-size: .8rem; gap: .2rem; }
+  button { padding: .45rem .8rem; border-radius: 6px; border: 1px solid #8888; background: #6663; cursor: pointer; font-size: .9rem; }
+  button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  input[type=text] { padding: .4rem; border-radius: 6px; border: 1px solid #8888; background: transparent; color: inherit; }
+  table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
+  th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid #8883; vertical-align: top; }
+  th { font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+  td.time { white-space: nowrap; color: #2563eb; cursor: pointer; font-variant-numeric: tabular-nums; }
+  td.time:hover { text-decoration: underline; }
+  .muted { opacity: .55; }
+  #status { font-size: .85rem; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<h1>🎬 Knowclip Lite</h1>
+
+<video id="video" controls></video>
+
+<div class="row">
+  <label class="file">Movie file
+    <input type="file" id="vfile" accept="video/*,audio/*">
+  </label>
+  <label class="file">Subtitle 1 — front / meaning (.srt/.vtt/.ass)
+    <input type="file" id="afile" accept=".srt,.vtt,.ass,text/*">
+  </label>
+  <label class="file">Subtitle 2 — back / translation (.srt/.vtt/.ass)
+    <input type="file" id="bfile" accept=".srt,.vtt,.ass,text/*">
+  </label>
+</div>
+
+<div class="row">
+  <button id="build">Build flashcards</button>
+  <label style="font-size:.85rem">Subtitle delay (s) <input type="number" id="delay" value="0" step="0.5" style="width:4.5rem"></label>
+  <button id="all">Add all</button>
+  <button id="none">Add none</button>
+  <input type="text" id="deck" value="Knowclip Deck" aria-label="Deck name">
+  <label style="font-size:.85rem"><input type="checkbox" id="media" checked> Bundle the movie into the .apkg (lands in collection.media on import)</label>
+  <button id="export" class="primary" disabled>Export Anki deck (.apkg)</button>
+  <span id="status" class="muted"></span>
+</div>
+
+<p id="warn" hidden style="color:#b45309; font-size:.85rem; max-width:780px">
+  ⚠ Anki Desktop can't decode H.264/MP4 (or MKV/AVI) inside a card — you get a black box. Convert the movie to WebM once, then load that file here:<br>
+  <code>ffmpeg -i movie.mp4 -c:v libvpx-vp9 -b:v 1M -row-mt 1 -cpu-used 4 -c:a libopus movie.webm</code>
+</p>
+
+<table id="tbl" hidden>
+  <thead><tr><th></th><th>Time</th><th>Front (meaning)</th><th>Back (translation)</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<script type="module">
+import { parseSubs, buildCards } from './subs.js';
+
+const $ = id => document.getElementById(id);
+const video = $('video');
+let subsA = [], subsB = [], cards = [], movieFile = null;
+
+const fmt = ms => {
+  const s = Math.floor(ms / 1000);
+  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+};
+
+// Pinyin only when the text actually contains Han characters. ponytail: a dictionary is the only correct way.
+const CJK = /[一-鿿]/;
+const toPinyin = s => (s && CJK.test(s) && window.pinyinPro)
+  ? pinyinPro.pinyin(s, { toneType: 'symbol', nonZh: 'consecutive' }) : '';
+
+$('vfile').onchange = e => {
+  movieFile = e.target.files[0] || null;
+  if (movieFile) {
+    video.src = URL.createObjectURL(movieFile);
+    // Anki desktop's webview has no H.264 — only WebM/Ogg play inline (else black screen).
+    $('warn').hidden = /\.(webm|ogg|ogv)$/i.test(movieFile.name);
+  }
+};
+
+// Anki media filename: leading underscore so "Check Media" won't purge it; no spaces.
+const mediaName = f => '_' + f.name.replace(/[^\w.-]+/g, '_');
+const loadSubs = which => async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const cues = parseSubs(await f.text());
+  if (which === 'a') subsA = cues; else subsB = cues;
+  $('status').textContent = `${subsA.length} + ${subsB.length} cues loaded`;
+};
+$('afile').onchange = loadSubs('a');
+$('bfile').onchange = loadSubs('b');
+
+// play just one segment, then pause
+let stopAt = null;
+video.addEventListener('timeupdate', () => {
+  if (stopAt !== null && video.currentTime >= stopAt) { video.pause(); stopAt = null; }
+});
+
+$('build').onclick = () => {
+  if (!subsA.length) { $('status').textContent = 'Load subtitle 1 first.'; return; }
+  // Positive delay = subtitles appear later; shift both tracks before aligning.
+  const ms = (parseFloat($('delay').value) || 0) * 1000;
+  const shift = cues => ms ? cues.map(c => ({ ...c, start: Math.max(0, c.start + ms), end: Math.max(0, c.end + ms) })) : cues;
+  cards = buildCards(shift(subsA), shift(subsB));
+  render();
+};
+$('all').onclick = () => { cards.forEach(c => c.include = true); render(); };
+$('none').onclick = () => { cards.forEach(c => c.include = false); render(); };
+
+// table cell: text plus a muted pinyin line when the text is Chinese
+function cell(text) {
+  const td = document.createElement('td');
+  td.textContent = text;
+  if (!text) td.className = 'muted';
+  const py = toPinyin(text);
+  if (py) {
+    const d = document.createElement('div');
+    d.className = 'muted'; d.style.fontSize = '.8rem';
+    d.textContent = py;
+    td.append(d);
+  }
+  return td;
+}
+
+function render() {
+  const body = $('tbl').querySelector('tbody');
+  body.replaceChildren();
+  for (const c of cards) {
+    const tr = document.createElement('tr');
+
+    const tdChk = document.createElement('td');
+    const chk = document.createElement('input');
+    chk.type = 'checkbox';
+    chk.checked = c.include;
+    chk.onchange = () => { c.include = chk.checked; };
+    tdChk.append(chk);
+
+    const tdTime = document.createElement('td');
+    tdTime.className = 'time';
+    tdTime.textContent = fmt(c.start);
+    tdTime.title = 'Play this segment';
+    tdTime.onclick = () => { video.currentTime = c.start / 1000; stopAt = c.end / 1000; video.play(); };
+
+    tr.append(tdChk, tdTime, cell(c.front), cell(c.back));
+    body.append(tr);
+  }
+  $('tbl').hidden = cards.length === 0;
+  $('export').disabled = cards.length === 0;
+  $('status').textContent = `${cards.length} cards`;
+}
+
+// ---- Anki .apkg export (schema v11, no media) ----
+const SCHEMA = `
+CREATE TABLE col (id integer primary key, crt integer not null, mod integer not null, scm integer not null, ver integer not null, dty integer not null, usn integer not null, ls integer not null, conf text not null, models text not null, decks text not null, dconf text not null, tags text not null);
+CREATE TABLE notes (id integer primary key, guid text not null, mid integer not null, mod integer not null, usn integer not null, tags text not null, flds text not null, sfld integer not null, csum integer not null, flags integer not null, data text not null);
+CREATE TABLE cards (id integer primary key, nid integer not null, did integer not null, ord integer not null, mod integer not null, usn integer not null, type integer not null, queue integer not null, due integer not null, ivl integer not null, factor integer not null, reps integer not null, lapses integer not null, left integer not null, odue integer not null, odid integer not null, flags integer not null, data text not null);
+CREATE TABLE graves (usn integer not null, oid integer not null, type integer not null);
+CREATE TABLE revlog (id integer primary key, cid integer not null, usn integer not null, ease integer not null, ivl integer not null, lastIvl integer not null, factor integer not null, time integer not null, type integer not null);
+CREATE INDEX ix_notes_usn on notes (usn);
+CREATE INDEX ix_cards_usn on cards (usn);
+CREATE INDEX ix_revlog_usn on revlog (usn);
+CREATE INDEX ix_cards_nid on cards (nid);
+CREATE INDEX ix_cards_sched on cards (did, queue, due);
+CREATE INDEX ix_revlog_cid on revlog (cid);
+CREATE INDEX ix_notes_csum on notes (csum);
+`;
+
+async function csum(str) {
+  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(str));
+  const b = new Uint8Array(buf);
+  return ((b[0] << 24) >>> 0) + (b[1] << 16) + (b[2] << 8) + b[3]; // first 8 hex chars as int
+}
+const guid = () => Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+const esc = s => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+
+$('export').onclick = async () => {
+  const chosen = cards.filter(c => c.include);
+  if (!chosen.length) { $('status').textContent = 'Nothing selected.'; return; }
+  $('export').disabled = true;
+
+  // Video mode: cards reference the movie by its collection.media filename + a time range; the
+  // card's Play button windows that range. The movie itself is bundled once (not cut into clips).
+  const videoMode = !!movieFile;
+  const movieMedia = movieFile ? mediaName(movieFile) : '';
+  const embedMovie = $('media').checked && videoMode;
+
+  $('status').textContent = 'Building deck…';
+  const SQL = await initSqlJs({ locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${f}` });
+  const db = new SQL.Database();
+  db.run(SCHEMA);
+
+  const now = Date.now(), sec = Math.floor(now / 1000);
+  const deckId = now, modelId = now + 1, deckName = $('deck').value || 'Knowclip Deck';
+
+  const conf = { nextPos: chosen.length + 1, estTimes: true, activeDecks: [1], sortType: 'noteFld', timeLim: 0, sortBackwards: false, addToCur: true, curDeck: 1, newBury: true, newSpread: 0, dueCounts: true, curModel: String(modelId), collapseTime: 1200 };
+  // Front shows just the text + pinyin; the back reveals the translation and the video clip.
+  // The button seeks the movie to this segment and pauses at its end — no constant looping.
+  const QFMT =
+`{{Front}}
+{{#Pinyin}}<div style="color:#888;font-size:.85em">{{Pinyin}}</div>{{/Pinyin}}`;
+  const AFMT =
+`{{FrontSide}}
+
+<hr id=answer>
+
+{{#Pinyin}}<div style="color:#888;font-size:.85em">{{Pinyin}}</div>{{/Pinyin}}
+
+{{Back}}
+
+{{#Path}}
+<video
+  id="kc"
+  src="{{Path}}"
+  controls
+  playsinline
+  preload="metadata"
+  style="max-width:50%;display:block;margin:10px auto">
+</video>
+
+<button
+  id="kcplay"
+  type="button"
+  style="font-size:18px;padding:6px 16px;cursor:pointer">
+  ▶ Play clip
+</button>
+
+<script>
+(function(){
+  var v = document.getElementById('kc');
+  var b = document.getElementById('kcplay');
+  if (!v || !b) return;
+
+  var s = parseFloat('{{Start}}') || 0;
+  var e = parseFloat('{{End}}') || 0;
+  var autoPlayed = false;
+
+  function stopAtEnd() {
+    if (e && v.currentTime >= e) {
+      v.pause();
+      v.removeEventListener('timeupdate', stopAtEnd);
+    }
+  }
+
+  function playClip() {
+    v.removeEventListener('timeupdate', stopAtEnd);
+
+    try {
+      v.currentTime = s;
+    } catch (x) {}
+
+    v.addEventListener('timeupdate', stopAtEnd);
+
+    var p = v.play();
+    if (p && p.catch) {
+      p.catch(function(){});
+    }
+  }
+
+  function autoPlayOnce() {
+    if (autoPlayed) return;
+    autoPlayed = true;
+    playClip();
+  }
+
+  b.addEventListener('click', playClip);
+
+  if (v.readyState >= 1) {
+    autoPlayOnce();
+  } else {
+    v.addEventListener('loadedmetadata', autoPlayOnce, { once: true });
+  }
+})();
+<\/script>
+{{/Path}}`;
+  const models = { [modelId]: { id: modelId, name: 'Custom Knowclip', type: 0, mod: sec, usn: -1, sortf: 0, did: deckId,
+    tmpls: [{ name: 'Card 1', ord: 0, qfmt: QFMT, afmt: AFMT, bqfmt: '', bafmt: '', did: null, bfont: '', bsize: 0 }],
+    flds: ['Front', 'Back', 'Path', 'Start', 'End', 'Pinyin'].map((name, ord) => ({ name, ord, sticky: false, rtl: false, font: 'Arial', size: 20, media: [] })),
+    css: '.card{font-family:arial;font-size:20px;text-align:center;color:black;background:#fff}', latexPre: '', latexPost: '', req: [[0, 'any', [0, 2]]], tags: [], vers: [] } };
+  const deckObj = { mod: sec, usn: -1, lrnToday: [0, 0], revToday: [0, 0], newToday: [0, 0], timeToday: [0, 0], collapsed: false, browserCollapsed: false, desc: '', dyn: 0, conf: 1, extendNew: 0, extendRev: 0 };
+  const decks = { '1': { id: 1, name: 'Default', ...deckObj }, [deckId]: { id: deckId, name: deckName, ...deckObj } };
+  const dconf = { '1': { id: 1, name: 'Default', replayq: true, timer: 0, maxTaken: 60, usn: 0, mod: 0, autoplay: true,
+    lapse: { leechFails: 8, minInt: 1, delays: [10], leechAction: 1, mult: 0 },
+    rev: { perDay: 200, fuzz: 0.05, ivlFct: 1, maxIvl: 36500, minSpace: 1, ease4: 1.3, bury: false, hardFactor: 1.2 },
+    new: { perDay: 20, delays: [1, 10], separate: true, ints: [1, 4, 7], initialFactor: 2500, bury: false, order: 1 } } };
+
+  db.run('INSERT INTO col (id,crt,mod,scm,ver,dty,usn,ls,conf,models,decks,dconf,tags) VALUES (1,?,?,?,11,0,0,0,?,?,?,?,?)',
+    [sec, now, now, JSON.stringify(conf), JSON.stringify(models), JSON.stringify(decks), JSON.stringify(dconf), '{}']);
+
+  const ns = db.prepare('INSERT INTO notes VALUES (?,?,?,?,?,?,?,?,?,?,?)');
+  const cs = db.prepare('INSERT INTO cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+  for (let i = 0; i < chosen.length; i++) {
+    const c = chosen[i], nid = now + i * 2, cid = now + i * 2 + 1;
+    const path = videoMode ? movieMedia : '';
+    const start = videoMode ? (c.start / 1000).toFixed(3) : '';
+    const end = videoMode ? (c.end / 1000).toFixed(3) : '';
+    const py = toPinyin(c.front) || toPinyin(c.back); // whichever side is the Chinese
+    const flds = [esc(c.front), esc(c.back), path, start, end, esc(py)].join('\x1f');
+    ns.run([nid, guid(), modelId, sec, -1, '', flds, c.front, await csum(c.front), 0, '']);
+    cs.run([cid, nid, deckId, 0, sec, -1, 0, 0, i + 1, 0, 0, 0, 0, 0, 0, 0, 0, '']);
+  }
+  ns.free(); cs.free();
+
+  $('status').textContent = embedMovie ? 'Packing .apkg (bundling movie)…' : 'Packing .apkg…';
+  const zip = new JSZip();
+  zip.file('collection.anki2', db.export());
+  const mediaJson = {};
+  if (embedMovie) { zip.file('0', movieFile, { compression: 'STORE' }); mediaJson['0'] = movieMedia; } // STORE: don't recompress video
+  zip.file('media', JSON.stringify(mediaJson));
+  const blob = await zip.generateAsync({ type: 'blob' });
+  db.close();
+
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${deckName.replace(/[^\w.-]+/g, '_')}.apkg`;
+  a.click();
+  $('export').disabled = false;
+  $('status').textContent = `Exported ${chosen.length} cards` +
+    (embedMovie ? ` + movie bundled as ${movieMedia}` :
+     videoMode ? ` — now copy your movie into collection.media as ${movieMedia}` : '') +
+    ` → ${a.download}`;
+};
+</script>
+</body>
+</html>
